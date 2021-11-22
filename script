@@ -1,457 +1,149 @@
+import uuid
+
 from django.conf import settings
-from django.utils.translation import gettext as _
 
-from directory_service.transport.models import Method, Transport
-from directory_service.utils import get_ipa_field
+from directory_service.serializers.ad_mapping import AdMappingSerializer
+from directory_service.transport.ad_mapping import AdMappingTransport
+from directory_service.transport.ad_profile import AdProfileTransport
+from directory_service.transport.ad_trust import AdTrustTransport
+from directory_service.transport.dns_forward_zones import DnsForwardZoneTransport
 from directory_service.transport.logon import IPAError
-from directory_service.views import to_log
+from directory_service.transport.models import BaseTransport
 from directory_service.utils import get_result_batch_response_list
+from project import ProjectError
 
 
-class TopologySegmentTransport(Transport):
+class AdConnectionTransport(BaseTransport):
 
-    # ipa topologysegment-find
-    @staticmethod
-    def find(topologysuffixcn=None, sizelimit=0, attrs=None):
-        """Возвращает список сегментов топологии
+    @classmethod
+    def find(cls, ident=None, attrs=None, sizelimit=0):
+        result = cls.request([
+            AdProfileTransport.Find(ident=ident, attrs=attrs, sizelimit=sizelimit),
+            AdTrustTransport.Find(ident=ident, attrs=attrs, sizelimit=sizelimit),
+        ])
 
-        Arguments:
-            topologysuffixcn (str): Маска имени суффикса
-            sizelimit (int): Ограничение на количество найденных имён (0 - не ограничено)
-            attrs (Dict[str, Any]): Словарь с дополнительными параметрами поиска
+        # Сливаем данные, как будто был получен объект одного типа
+        merged_data = {}
+        entity_keys = ('is_profile', 'is_trust')
+        for ind, entity_key in enumerate(entity_keys):
+            for el in result[ind][1]:
+                cn = el.get('cn', [None])[0]
+                if not merged_data.get(cn):
+                    merged_data[cn] = {key: False for key in entity_keys}
+                merged_data[cn][entity_key] = True
 
-        Returns:
-            List[Dict[str, Any]]: Список найденных сегментов топологии
+        result = [{'cn': [key], **val} for key, val in merged_data.items()]
 
-            Если маска имени сегмента топологии не указана, возвращает список всех сегментов топологии
+        return result
 
-        """
+    @classmethod
+    def delete(cls, ident, attrs=None):
+        try:
+            AdTrustTransport.delete(ident=ident, attrs=attrs)
+        except IPAError:
+            pass
+        return AdProfileTransport.delete(ident=ident, attrs=attrs)
 
-        from directory_service.transport.domain_controller import DomainControllerTransport
-
-        topologysuffixcn = topologysuffixcn or settings.DEFAULT_TOPOLOGYSUFFIXCN
-
-        topologysegments = TopologySegmentTransport.request(TopologySegmentTransport.Find(
-            topologysuffixcn=topologysuffixcn,
-            sizelimit=sizelimit,
-            attrs=attrs)
+    @classmethod
+    def _get_entities(cls, ident, to_update_objects=None, attrs=None, field_key=None, transport=None):
+        entity_names = cls.get(ident, attrs).get(field_key, [])
+        entities = get_result_batch_response_list(
+            cls.batch_request([transport.Get(ident=cn) for cn in entity_names])
         )
-        if not topologysegments:
+        return entities
+
+    @classmethod
+    def _get_entities_by_find(cls, ident, to_update_objects=None, attrs=None, field_key=None, transport=None):
+        parent_entity = cls.find(ident, attrs)
+        if not parent_entity:
             return []
-
-        validated_topologysegments = []
-        leftservers = []
-        rightservers = []
-
-        leftservers, rightservers = TopologySegmentTransport._extract_left_right_servers(topologysegments)
-
-        valid_flags, leftvalids, rightvalids = TopologySegmentTransport._check_validity_topologysegments(leftservers,
-                                                                                                         rightservers,
-                                                                                                         many=True)
-
-        for ts, valid_flag, leftvalid, rightvalid in zip(topologysegments, valid_flags, leftvalids, rightvalids):
-            if valid_flag:
-                validated_topologysegments.append(ts)
-            else:
-                msg = TopologySegmentTransport._get_log_msg_error_validity(leftvalid, rightvalid)
-                to_log(__name__, 'error', _('Ошибка валидности соглашения: ') + str(msg))
-
-        leftservers, rightservers = TopologySegmentTransport._extract_left_right_servers(validated_topologysegments)
-
-        servers = leftservers + rightservers
-        sites = DomainControllerTransport._get_site(servers, many=True)
-        ips = DomainControllerTransport.get_ip(servers, many=True)
-        half_len = int(len(servers) / 2)
-
-        leftsites = sites[:half_len]
-        rightsites = sites[half_len:]
-        leftips = ips[:half_len]
-        rightips = ips[half_len:]
-
-        for ts, leftsite, rightsite, leftip, rightip in zip(validated_topologysegments, leftsites, rightsites, leftips,
-                                                            rightips):
-            ts['leftsite'] = leftsite
-            ts['rightsite'] = rightsite
-            ts['leftip'] = leftip
-            ts['rightip'] = rightip
-
-        return validated_topologysegments
-
-    # ipa topologysegment-show
-    @staticmethod
-    def get(cn, topologysuffixcn=None, attrs=None):
-        """Возвращает все атрибуты сегмента топологии
-
-        Arguments:
-            cn (str): Имя сегмента топологии
-            topologysuffixcn (str): Суффикс
-            attrs (Dict[str, Any]): Словарь с дополнительными параметрами поиска
-
-        Returns:
-            Dict[str, Any]: Словарь с дополнительными атрибутами
-
-        """
-
-        from directory_service.transport.domain_controller import DomainControllerTransport
-
-        topologysuffixcn = topologysuffixcn or settings.DEFAULT_TOPOLOGYSUFFIXCN
-        topologysegment = TopologySegmentTransport.request(
-            TopologySegmentTransport.Get(cn=cn, topologysuffixcn=topologysuffixcn, attrs=attrs))
-
-        leftserver = get_ipa_field(topologysegment, 'iparepltoposegmentleftnode')
-        rightserver = get_ipa_field(topologysegment, 'iparepltoposegmentrightnode')
-
-        ts_valid_flag = TopologySegmentTransport._check_validity_topologysegments([leftserver], [rightserver])
-
-        if not ts_valid_flag[0]:
-            raise IPAError(_('Ошибка валидности соглашения:'),
-                           TopologySegmentTransport._get_log_msg_error_validity(ts_valid_flag[1], ts_valid_flag[2]))
-
-        servers = [leftserver, rightserver]
-        sites = DomainControllerTransport._get_site(servers, many=True)
-        ips = DomainControllerTransport.get_ip(servers, many=True)
-
-        topologysegment['leftsite'] = sites[0]
-        topologysegment['rightsite'] = sites[1]
-        topologysegment['leftip'] = ips[0]
-        topologysegment['rightip'] = ips[1]
-
-        return topologysegment
-
-    @staticmethod
-    def _check_validity_topologysegments(leftservers, rightservers, many=False):
-        from directory_service.transport.domain_controller import DomainControllerTransport
-
-        servers_cn = leftservers + rightservers
-        servers = TopologySegmentTransport.request(
-            [DomainControllerTransport.GetServer(server=cn) for cn in servers_cn], raise_on_err=False)
-        half_len = int(len(servers) / 2)
-        leftservers = get_result_batch_response_list(servers[:half_len])
-        rightservers = get_result_batch_response_list(servers[half_len:])
-        result = []
-
-        for leftserver, rightserver in zip(leftservers, rightservers):
-            if leftserver.get('error', None) or rightserver.get('error', None):
-                result.append(False)
-            else:
-                result.append(True)
-
-        return (result, leftservers, rightservers) if many else (result[0], leftservers[0], rightservers[0])
-
-    @staticmethod
-    def _extract_left_right_servers(topologysegments):
-        leftservers, rightservers = [], []
-
-        for ts in topologysegments:
-            leftservers.append(get_ipa_field(ts, 'iparepltoposegmentleftnode'))
-            rightservers.append(get_ipa_field(ts, 'iparepltoposegmentrightnode'))
-
-        return leftservers, rightservers
-
-    @staticmethod
-    def _get_log_msg_error_validity(leftvalid, rightvalid):
-        msg = ''
-        errornode = None
-        if leftvalid.get('error', None):
-            errornode = leftvalid
-        else:
-            errornode = rightvalid
-        if isinstance(errornode.get('error', ''), dict):
-            msg = errornode.get('error', {}).get('message', 'error')
-        else:
-            msg = errornode.get('error', 'error')
-
-        return msg
-
-    # ipa topologysegment-add
-    @staticmethod
-    def add(cn, leftnode, rightnode, topologysuffixcn=None, attrs=None):
-        """Создает сегмент топологии
-
-        Arguments:
-            cn (str): Имя сегмента топологии
-            attrs (Dict[str, Any]): Словарь с дополнительными параметрами
-        
-        Returns:
-            str: При успешном выполнении операции возвращает имя созданного сегмента топологии
-
-        """
-
-        attrs = attrs or {}
-
-        topologysuffixcn = topologysuffixcn or settings.DEFAULT_TOPOLOGYSUFFIXCN
-
-        topologysegment = TopologySegmentTransport.request(TopologySegmentTransport.Add(
-            cn=cn,
-            topologysuffixcn=topologysuffixcn,
-            iparepltoposegmentleftnode=leftnode,
-            iparepltoposegmentrightnode=rightnode,
-            attrs=attrs)
+        entity_names = parent_entity[0].get(field_key, [])
+        entities = get_result_batch_response_list(
+            cls.batch_request([transport.Get(ident=cn) for cn in entity_names])
         )
+        return entities
 
-        return topologysegment
+    @classmethod
+    def _delete_entities_by_find(cls, ident, to_update_objects=None, attrs=None, field_key=None, transport=None):
+        parent_entity = cls.find(ident, attrs)
+        if not parent_entity:
+            return []
+        entity_names = parent_entity[0].get(field_key, [])
+        entities = get_result_batch_response_list(
+            cls.batch_request([transport.Delete(ident=cn) for cn in entity_names])
+        )
+        return entities
 
-    # ipa topologysegment-mod
-    @staticmethod
-    def update(cn, topologysuffixcn=None, attrs=None):
-        """Изменяет запись сегмента топологии
+    @classmethod
+    def get_mappings(cls, ident, to_update_objects=None, attrs=None):
+        field_key = 'member_admapping'
+        transport = AdMappingTransport
+        entities = AdProfileTransport._get_entities_by_find(
+            ident=ident,
+            to_update_objects=to_update_objects,
+            attrs=attrs,
+            field_key=field_key,
+            transport=transport
+        )
+        return entities
 
-        Arguments:
-            cn (str): Имя сегмента топологии
-            topologysuffixcn (str): Суффикс
-            attrs (Dict[str, Any]): Словарь с дополнительными параметрами
-        
-        Returns:
-            bool: При успешном выполнении операции возвращает True
+    @classmethod
+    def post_mappings(cls, ident, to_update_objects=None, attrs=None):
+        field_key = 'admapping'
+        name = '{}/{}/{}'.format(ident, to_update_objects.get('admapping_source_attribute_name'),
+                                 to_update_objects.get('admapping_object'))
+        admapping_cn = str(uuid.uuid3(uuid.NAMESPACE_X500, name))
+        add_attrs = {field_key: admapping_cn}
+        mapping_data = {'admapping_common_name': admapping_cn}
+        mapping_data.update(to_update_objects)
+        serializer = AdMappingSerializer(data=mapping_data)
+        serializer.is_valid(raise_exception=True)
+        serializer.save()
+        cls.request(AdProfileTransport.AddMember(ident=ident, attrs=add_attrs))
+        return []
 
-        """
+    @classmethod
+    def delete_mappings(cls, ident, to_update_objects=None, attrs=None):
+        pks = [val for el in to_update_objects for key, val in el.items()]
+        cls.request(AdMappingTransport.Delete(ident=pks))
+        return []
 
+    @classmethod
+    def get(cls, ident, attrs=None):
         attrs = attrs or {}
+        attrs.update({'vaultpassword': settings.AD_IPA_VAULT_MASTER_KEY})
+        batch_requests = [
+            DnsForwardZoneTransport.Get(idnsname=ident),
+            AdTrustTransport.Find(ident=ident),  # TODO: Сменить на .Get как будет настроен траст
+            AdProfileTransport.Get(ident=ident, attrs=attrs),
+        ]
+        result = cls.batch_request(batch_requests, raise_on_err=False)
+        data = {}
+        dns_data = result[0][1]
+        trust_data = result[1][1][0] if result[1][1] else {}
+        profile_data = result[2][1]
 
-        topologysuffixcn = topologysuffixcn or settings.DEFAULT_TOPOLOGYSUFFIXCN
-        TopologySegmentTransport.request(
-            TopologySegmentTransport.Update(cn=cn, topologysuffixcn=topologysuffixcn, attrs=attrs))
+        dns_data = dns_data if not dns_data.get('error') else {}
+        profile_data = profile_data if not profile_data.get('error') else {}
 
-        return True
+        if not (trust_data or profile_data):
+            raise ProjectError(
+                'Not found',
+                'AdProfile nor AdTrust not found.',
+                code=404,
+            )
 
-    # ipa topologysegment-reinitialize
-    @staticmethod
-    def reinitialize(cn, topologysuffixcn=None, attrs=None):
-        """Переинициализирует запись сегмента топологии
+        data.update({'adconnection_dns_forward_zone': dns_data})
+        data.update({'adconnection_domain_trust': trust_data})
+        data.update({'adconnection_domain_profile': profile_data})
+        data.update({'cn': ident})
+        return data
 
-        Arguments:
-            cn (str): Имя сегмента топологии
-            topologysuffixcn (str): Суффикс
-            attrs (Dict[str, Any]): Словарь с дополнительными параметрами
-        
-        Returns:
-            bool: При успешном выполнении операции возвращает True
-
-        """
-
-        attrs = attrs or {}
-
-        topologysuffixcn = topologysuffixcn or settings.DEFAULT_TOPOLOGYSUFFIXCN
-        TopologySegmentTransport.request(
-            TopologySegmentTransport.Reinitialize(cn=cn, topologysuffixcn=topologysuffixcn, attrs=attrs))
-
-        return True
-
-    # ipa topologysegment-del
-    @staticmethod
-    def delete(cn, topologysuffixcn=None):
-        """Удаляет сегмент топологии
-
-        Arguments:
-            cn (str): Имя
-            topologysuffixcn (str): Суффикс
-
-        Returns:
-            bool: При успешном выполнении операции возвращает True
-
-        """
-
-        topologysuffixcn = topologysuffixcn or settings.DEFAULT_TOPOLOGYSUFFIXCN
-        TopologySegmentTransport.request(TopologySegmentTransport.Delete(cn=cn, topologysuffixcn=topologysuffixcn))
-
-        return True
-
-    class Find(Method):
-        """Возвращает список сегментов топологии
-
-        Arguments:
-            topologysuffixcn (str): Маска имени суффикса
-            sizelimit (int): Ограничение на количество найденных имён (0 - не ограничено)
-            attrs (Dict[str, Any]): Словарь с дополнительными параметрами поиска
-
-        Returns:
-            List[Dict[str, Any]]: Список найденных сегментов топологии
-
-            Если маска имени сегмента топологии не указана, возвращает список всех сегментов топологии
-
-        """
-
-        method = 'topologysegment_find'
-        kwargs = {'topologysuffixcn': None, 'sizelimit': 0, 'attrs': {}}
-
-        def item(self, kwargs):
-            return kwargs.get('topologysuffixcn')
-
-        def params(self, kwargs):
-            data = {
-                'all': False,
-                'sizelimit': kwargs.get('sizelimit'),
-            }
-            data.update(kwargs.get('attrs') or {})
-            return data
-
-    class Get(Method):
-        """Возвращает все атрибуты сегмента топологии
-
-        Arguments:
-            cn (str): Имя сегмента топологии
-            topologysuffixcn (str): Суффикс
-            attrs (Dict[str, Any]): Словарь с дополнительными параметрами поиска
-
-        Returns:
-            Dict[str, Any]: Словарь с атрибутами записи
-
-        """
-
-        method = 'topologysegment_show'
-        kwargs = {'cn': None, 'topologysuffixcn': None, 'attrs': {}}
-
-        def kwargs_validate(self, kwargs):
-            return None not in [kwargs.get('cn'), kwargs.get('topologysuffixcn')]
-
-        def item(self, kwargs):
-            return kwargs.get('topologysuffixcn'), kwargs.get('cn')
-
-        def params(self, kwargs):
-            data = {
-                'all': True,
-                'raw': False,
-                'rights': False,
-            }
-            data.update(kwargs.get('attrs') or {})
-            return data
-
-    class Add(Method):
-        """Создает сегмент топологии
-
-        Arguments:
-            cn (str): Имя сегмента топологии
-            topologysuffixcn (str): Суффикс
-            iparepltoposegmentleftnode (str): Левый узел
-            iparepltoposegmentrightnode (str): Правый узел
-        
-        Keyword arguments:
-            Dict(str, Any): Перечень иных полей
-
-        Returns:
-            bool: При успешном выполнении операции возвращает True
-
-        """
-
-        method = 'topologysegment_add'
-        kwargs = {
-            'cn': None,
-            'topologysuffixcn': None,
-            'iparepltoposegmentleftnode': None,
-            'iparepltoposegmentrightnode': None
+    @classmethod
+    def post_reset_password(cls, ident, to_update_objects=None, attrs=None):
+        mod_attrs = {
+            'rbtaadpassword': to_update_objects.get('adprofile_user_password'),
+            'vaultpassword': settings.AD_IPA_VAULT_MASTER_KEY,
         }
-
-        def kwargs_validate(self, kwargs):
-            return None not in [
-                kwargs.get('cn'),
-                kwargs.get('topologysuffixcn'),
-                kwargs.get('iparepltoposegmentleftnode'),
-                kwargs.get('iparepltoposegmentrightnode')
-            ]
-
-        def item(self, kwargs):
-            return kwargs.get('topologysuffixcn'), kwargs.get('cn')
-
-        def params(self, kwargs):
-            data = {
-                'iparepltoposegmentleftnode': kwargs.get('iparepltoposegmentleftnode'),
-                'iparepltoposegmentrightnode': kwargs.get('iparepltoposegmentrightnode'),
-                'all': True,
-                'raw': False,
-            }
-            data.update(kwargs.get('attrs') or {})
-
-            return data
-
-        def result(self, data):
-            return True
-
-    class Reinitialize(Method):
-        """Переинициализирует сегмент топологии
-
-        Arguments:
-            cn (str): Имя сегмента топологии
-            topologysuffixcn (str): Суффикс
-            attrs (Dict[str, Any]): Словарь с дополнительными параметрами
-        
-        Keyword arguments:
-            Dict(str, Any): Перечень изменений иных полей
-
-        Returns:
-            bool: При успешном выполнении операции возвращает True
-
-        """
-
-        method = 'topologysegment_reinitialize'
-        kwargs = {'cn': None, 'topologysuffixcn': None, 'attrs': {}}
-
-        def kwargs_validate(self, kwargs):
-            return None not in [kwargs.get('cn'), kwargs.get('topologysuffixcn')]
-
-        def item(self, kwargs):
-            return kwargs.get('topologysuffixcn'), kwargs.get('cn')
-
-        def params(self, kwargs):
-            data = kwargs.get('attrs') or {}
-            return data
-
-    class Update(Method):
-        """Обновить сегмент топологии
-
-        Arguments:
-            cn (str): Имя сегмента топологии
-            topologysuffixcn (str): Суффикс
-            attrs (Dict[str, Any]): Словарь с дополнительными параметрами
-        
-        Keyword arguments:
-            Dict(str, Any): Перечень изменений иных полей
-
-        Returns:
-            bool: При успешном выполнении операции возвращает True
-
-        """
-
-        method = 'topologysegment_mod'
-        kwargs = {'cn': None, 'topologysuffixcn': None, 'attrs': {}}
-
-        def kwargs_validate(self, kwargs):
-            return None not in [kwargs.get('cn'), kwargs.get('topologysuffixcn')]
-
-        def item(self, kwargs):
-            return kwargs.get('topologysuffixcn'), kwargs.get('cn')
-
-        def params(self, kwargs):
-            data = {
-                'all': True,
-                'raw': False,
-                'rights': False,
-            }
-            data.update(kwargs.get('attrs') or {})
-            return data
-
-    class Delete(Method):
-        """Удаляет сегмент топологии
-
-        Arguments:
-            cn (str): Имя сегмента топологии
-            topologysuffixcn (str): Суффикс 
-
-        Returns:
-            bool: При успешном выполнении операции возвращает True
-
-        """
-
-        method = 'topologysegment_del'
-        kwargs = {'cn': None, 'topologysuffixcn': None}
-
-        def kwargs_validate(self, kwargs):
-            return None not in [kwargs.get('cn'), kwargs.get('topologysuffixcn')]
-
-        def item(self, kwargs):
-            return kwargs.get('topologysuffixcn'), kwargs.get('cn')
-
-        def params(self, kwargs):
-            return {}
-
-        def result(self, data):
-            return True
+        cls.request(AdProfileTransport.Update(ident=ident, attrs=mod_attrs))
+        return []
